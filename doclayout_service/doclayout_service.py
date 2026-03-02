@@ -90,31 +90,48 @@ class DolphinV2Service(LayoutDetectionService):
     def __init__(
         self,
         model_path: Optional[str] = "",
+        infer_mode: str = "vllm",
+        server_url: str = "http://127.0.0.1:8000/v1",
     ):
-        import torch
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        assert infer_mode in [
+            "vllm",
+            "transformers",
+        ], "dolphinv2 infer_mode must be one of ['vllm', 'transformers']"
 
-        # Load model from local path or Hugging Face hub
-        self.processor = AutoProcessor.from_pretrained(model_path)
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path)
-        self.model.eval()
+        self.infer_mode = infer_mode
+        if infer_mode == "vllm":
+            from openai import OpenAI
 
-        # Set device and precision
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
+            self.client = OpenAI(
+                api_key="EMPTY",
+                base_url=server_url,
+            )
+            self.model = self.client.models.list().data[0].id
+            print("served model name", self.model)
 
-        if self.device == "cuda":
-            self.model = self.model.bfloat16()
-        else:
-            self.model = self.model.float()
+        elif infer_mode == "transformers":
+            import torch
+            from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-        # set tokenizer
-        self.tokenizer = self.processor.tokenizer
-        self.tokenizer.padding_side = "left"
+            # Load model from local path or Hugging Face hub
+            self.processor = AutoProcessor.from_pretrained(model_path)
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path)
+            self.model.eval()
+
+            # Set device and precision
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model.to(self.device)
+
+            if self.device == "cuda":
+                self.model = self.model.bfloat16()
+            else:
+                self.model = self.model.float()
+
+            # set tokenizer
+            self.tokenizer = self.processor.tokenizer
+            self.tokenizer.padding_side = "left"
 
     def chat(self, prompt, image):
-        from qwen_vl_utils import process_vision_info
-
         # Check if we're dealing with a batch
         is_batch = isinstance(image, list)
 
@@ -132,69 +149,97 @@ class DolphinV2Service(LayoutDetectionService):
         # preprocess all images
         processed_images = [self.resize_img(img) for img in images]
         # generate all messages
-        all_messages = []
-        for img, question in zip(processed_images, prompts):
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "image": img,
-                        },
-                        {"type": "text", "text": question},
-                    ],
-                }
+
+        if self.infer_mode == "vllm":
+            results = []
+            for img, question in zip(processed_images, prompts):
+                with io.BytesIO() as buf:
+                    img.save(buf, format="PNG")
+                    image_url = f"data:image/png;base64," + base64.b64encode(
+                        buf.getvalue()
+                    ).decode("ascii")
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": question},
+                        ],
+                    }
+                ]
+                chat_completion_from_url = self.client.chat.completions.create(
+                    messages=messages,
+                    model=self.model,
+                    temperature=0.0,
+                )
+                results.append(chat_completion_from_url.choices[0].message.content)
+
+        elif self.infer_mode == "transformers":
+            all_messages = []
+            from qwen_vl_utils import process_vision_info
+
+            for img, question in zip(processed_images, prompts):
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "image": img,
+                            },
+                            {"type": "text", "text": question},
+                        ],
+                    }
+                ]
+                all_messages.append(messages)
+            # prepare all texts
+            texts = [
+                self.processor.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True
+                )
+                for msgs in all_messages
             ]
-            all_messages.append(messages)
 
-        # prepare all texts
-        texts = [
-            self.processor.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
+            # collect all image inputs
+            all_image_inputs = []
+            all_video_inputs = None
+            for msgs in all_messages:
+                image_inputs, video_inputs = process_vision_info(msgs)
+                all_image_inputs.extend(image_inputs)
+
+            # prepare model inputs
+            inputs = self.processor(
+                text=texts,
+                images=all_image_inputs if all_image_inputs else None,
+                videos=all_video_inputs if all_video_inputs else None,
+                padding=True,
+                return_tensors="pt",
             )
-            for msgs in all_messages
-        ]
+            inputs = inputs.to(self.model.device)
 
-        # collect all image inputs
-        all_image_inputs = []
-        all_video_inputs = None
-        for msgs in all_messages:
-            image_inputs, video_inputs = process_vision_info(msgs)
-            all_image_inputs.extend(image_inputs)
+            # inference
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=4096,
+                do_sample=False,
+                temperature=None,
+                # repetition_penalty=1.05
+            )
+            generated_ids_trimmed = [
+                out_ids[len(in_ids) :]
+                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
 
-        # prepare model inputs
-        inputs = self.processor(
-            text=texts,
-            images=all_image_inputs if all_image_inputs else None,
-            videos=all_video_inputs if all_video_inputs else None,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(self.model.device)
-
-        # inference
-        generated_ids = self.model.generate(
-            **inputs,
-            max_new_tokens=4096,
-            do_sample=False,
-            temperature=None,
-            # repetition_penalty=1.05
-        )
-        generated_ids_trimmed = [
-            out_ids[len(in_ids) :]
-            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-
-        results = self.processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
+            results = self.processor.batch_decode(
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
 
         # Return a single result for single image input
         if not is_batch:
-            return results[0]
+            results = results[0]
+
         return results
 
     def parse_layout_string(self, bbox_str):
@@ -727,7 +772,9 @@ async def startup_event():
 
         elif SERVICE_TYPE == "dolphinv2":
             model_path = os.environ.get("DOCMODEL_PATH")
-            model_service = DolphinV2Service(model_path)
+            server_url = os.environ.get("DOLPHIN_SERVER_URL", "http://127.0.0.1:8000")
+            infer_mode = os.environ.get("DOLPHIN_INFER_MODE", "vllm")
+            model_service = DolphinV2Service(model_path, infer_mode, server_url)
 
         elif SERVICE_TYPE == "doclayout":
             import torch
@@ -858,10 +905,24 @@ if __name__ == "__main__":
         help="DocLayout模型路径（仅在--service doclayout时有效，默认: 环境变量DOCMODEL_PATH）",
     )
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--dolphin-infer-mode",
+        type=str,
+        default="vllm",
+        help="DolphinV2推理方式，默认为vllm",
+    )
+    parser.add_argument(
+        "--dolphin-url",
+        type=str,
+        default="http://127.0.0.1:8555/v1",
+        help="DolphinV2服务器地址（仅在--service dolphinv2时有效，默认: http://127.0.0.1:8555/v1",
+    )
     args = parser.parse_args()
 
     os.environ["SERVICE_TYPE"] = args.service
     os.environ["MINERU_SERVER_URL"] = args.mineru_url
+    os.environ["DOLPHIN_SERVER_URL"] = args.dolphin_url
+    os.environ["DOLPHIN_INFER_MODE"] = args.dolphin_infer_mode
 
     logger.info(f"✓ 服务地址: http://{args.host}:{args.port}")
 
